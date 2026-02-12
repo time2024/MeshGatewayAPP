@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MeshGateway" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#FF121220</item>
+        <item name="android:navigationBarColor">#FF121220</item>
+    </style>
+</resources>
