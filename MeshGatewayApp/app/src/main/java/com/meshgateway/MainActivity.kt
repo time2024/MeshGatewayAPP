@@ -9,6 +9,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
+import android.content.Context
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -51,6 +59,11 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.*
+import java.io.File
+import java.io.FileOutputStream
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 class MainActivity : ComponentActivity() {
 
@@ -163,6 +176,53 @@ val IMG_RESOLUTIONS = listOf(
 )
 
 /* ════════════════════════════════════════════════════════════
+ *  节点图片持久化工具
+ * ════════════════════════════════════════════════════════════ */
+
+object NodeImageStore {
+    private const val DIR_NAME = "node_images"
+
+    private fun getDir(context: Context): File {
+        val dir = File(context.filesDir, DIR_NAME)
+        if (!dir.exists()) dir.mkdirs()
+        return dir
+    }
+
+    fun save(context: Context, nodeAddr: Int, bitmap: Bitmap) {
+        try {
+            val file = File(getDir(context), "node_${String.format("%04X", nodeAddr)}.png")
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun load(context: Context, nodeAddr: Int): Bitmap? {
+        return try {
+            val file = File(getDir(context), "node_${String.format("%04X", nodeAddr)}.png")
+            if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else null
+        } catch (_: Exception) { null }
+    }
+
+    fun loadAll(context: Context): Map<Int, Bitmap> {
+        val dir = getDir(context)
+        val map = mutableMapOf<Int, Bitmap>()
+        dir.listFiles()?.forEach { file ->
+            try {
+                val name = file.nameWithoutExtension // e.g. "node_0A01"
+                if (name.startsWith("node_")) {
+                    val addrHex = name.removePrefix("node_")
+                    val addr = addrHex.toInt(16)
+                    val bmp = BitmapFactory.decodeFile(file.absolutePath)
+                    if (bmp != null) map[addr] = bmp
+                }
+            } catch (_: Exception) {}
+        }
+        return map
+    }
+}
+
+/* ════════════════════════════════════════════════════════════
  *  MeshApp — 主 Composable
  * ════════════════════════════════════════════════════════════ */
 
@@ -191,6 +251,14 @@ fun MeshApp(
     var imgTargetNode by remember { mutableStateOf<MeshNode?>(null) }
     var imgCropBitmap by remember { mutableStateOf<Bitmap?>(null) }           // 原图 → 裁剪对话框
     var imgPreviewData by remember { mutableStateOf<ImagePreviewData?>(null) } // 裁剪后 → 预览
+
+    val appContext = LocalContext.current.applicationContext
+    var lastSentBitmaps by remember { mutableStateOf(NodeImageStore.loadAll(appContext)) }
+
+    val imageBusy = imgSendState is BleManager.ImageSendState.Sending
+            || imgSendState is BleManager.ImageSendState.WaitingAck
+            || imgSendState is BleManager.ImageSendState.Finishing
+            || imgSendState is BleManager.ImageSendState.MeshTransfer
 
     fun clearTopologyState() { nodes = listOf(); gwAddr = 0; logs = listOf() }
     fun addLog(s: String) { logs = (logs + LogEntry(s)).takeLast(50) }
@@ -236,6 +304,18 @@ fun MeshApp(
         }
     }
 
+    // 定时自动查询拓扑 (每30秒, 图片传输中跳过)
+    LaunchedEffect(state, cccdReady) {
+        if (state == BleManager.ConnState.CONNECTED && cccdReady) {
+            while (isActive) {
+                delay(30_000L)
+                if (!ble.isImageBusy && state == BleManager.ConnState.CONNECTED) {
+                    if (ble.queryTopology()) addLog("→ 自动刷新拓扑")
+                }
+            }
+        }
+    }
+
     // 用户选图 → 打开裁剪
     LaunchedEffect(pickedImageUri.value) {
         val uri = pickedImageUri.value ?: return@LaunchedEffect
@@ -275,17 +355,17 @@ fun MeshApp(
                 BleManager.ConnState.CONNECTING -> CenterContent("正在连接 $devName ...")
                 BleManager.ConnState.CONNECTED ->
                     ConnectedPage(devName, gwAddr, nodes, logs, debug, topoQuerying, cccdReady, imgSendState,
-                        onQueryTopo = { if (ble.queryTopology()) addLog("→ 查询拓扑") },
+                        onQueryTopo = { if (!ble.isImageBusy && ble.queryTopology()) addLog("→ 查询拓扑") },
                         onDisconnect = { clearTopologyState(); ble.disconnect() },
-                        onNodeClick = { dlgNode = it },
-                        onBroadcast = { txt -> ble.broadcast(txt.toByteArray()); addLog("→ [广播] $txt") },
+                        onNodeClick = { if (!imageBusy) dlgNode = it },
+                        onBroadcast = { txt -> if (!imageBusy) { ble.broadcast(txt.toByteArray()); addLog("→ [广播] $txt") } },
                         onCancelImage = { ble.cancelImageSend(); addLog("→ 取消图片传输") }
                     )
             }
 
             /* ── 节点操作选择 ── */
             dlgNode?.let { node ->
-                NodeActionDialog(node, onDismiss = { dlgNode = null },
+                NodeActionDialog(node, lastSentBitmap = lastSentBitmaps[node.addr], onDismiss = { dlgNode = null },
                     onSendText = { dlgNode = null; textDlgNode = node },
                     onSendImage = { dlgNode = null; imgTargetNode = node; onPickImage() }
                 )
@@ -294,7 +374,8 @@ fun MeshApp(
             /* ── 文本发送 ── */
             textDlgNode?.let { node ->
                 SendDialog(node, onDismiss = { textDlgNode = null }, onSend = { txt ->
-                    ble.sendToNode(node.addr, txt.toByteArray()); addLog("→ [0x${h4(node.addr)}] $txt"); textDlgNode = null
+                    if (!imageBusy) { ble.sendToNode(node.addr, txt.toByteArray()); addLog("→ [0x${h4(node.addr)}] $txt") }
+                    textDlgNode = null
                 })
             }
 
@@ -315,10 +396,13 @@ fun MeshApp(
             /* ── 预览 & 发送 ── */
             imgPreviewData?.let { data ->
                 ImagePreviewDialog(data, onDismiss = { imgPreviewData = null; imgTargetNode = null },
-                    onSend = { processedData, w, h, mode ->
+                    onSend = { processedData, w, h, mode, previewBmp ->
                         val ok = ble.sendImage(data.node.addr, processedData, w, h, mode)
-                        if (ok) addLog("→ 图片 ${w}x${h} → 0x${h4(data.node.addr)} ${processedData.size}B ${if (mode == BleManager.ImageSendMode.FAST) "快速" else "ACK"} ${data.node.hops}跳")
-                        else addLog("图片发送失败 (正在发送中或未连接)")
+                        if (ok) {
+                            lastSentBitmaps = lastSentBitmaps + (data.node.addr to previewBmp)
+                            NodeImageStore.save(appContext, data.node.addr, previewBmp)
+                            addLog("→ 图片 ${w}x${h} → 0x${h4(data.node.addr)} ${processedData.size}B ${if (mode == BleManager.ImageSendMode.FAST) "快速" else "ACK"} ${data.node.hops}跳")
+                        } else addLog("图片发送失败 (正在发送中或未连接)")
                         imgPreviewData = null; imgTargetNode = null
                     }
                 )
@@ -391,9 +475,10 @@ fun ConnectedPage(
                 IconButton(onClick = onDisconnect) { Icon(Icons.Default.Close, "断开", tint = Color(0xFFEF5350)) }
             }
         }
-        Button(onClick = onQueryTopo, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp), enabled = cccdReady && !topoQuerying, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
+        Button(onClick = onQueryTopo, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp), enabled = cccdReady && !topoQuerying && !isImageBusy(imgSendState), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
             if (!cccdReady) { CircularProgressIndicator(Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp); Spacer(Modifier.width(6.dp)); Text("等待就绪...") }
             else if (topoQuerying) { CircularProgressIndicator(Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp); Spacer(Modifier.width(6.dp)); Text("查询中...") }
+            else if (isImageBusy(imgSendState)) { Text("图片传输中...", color = Color.Gray) }
             else { Icon(Icons.Default.AccountTree, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("查询节点") }
         }
         if (nodes.isNotEmpty()) {
@@ -441,7 +526,60 @@ fun ConnectedPage(
 }
 
 /* ════════════════════════════════════════════════════════════
- *  图片传输进度条 (不变)
+ *  动画条纹进度条 (向右流动)
+ * ════════════════════════════════════════════════════════════ */
+
+@Composable
+fun AnimatedStripeBar(
+    modifier: Modifier = Modifier,
+    color: Color = Color(0xFF4FC3F7),
+    trackColor: Color = Color.Gray.copy(alpha = 0.3f),
+    barHeight: Float = 4f,
+    stripeWidth: Float = 24f
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "stripe")
+    val offset by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = stripeWidth * 2,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 600, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "stripeOffset"
+    )
+
+    Canvas(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(barHeight.dp)
+            .clip(RoundedCornerShape(2.dp))
+    ) {
+        val w = size.width
+        val h = size.height
+        // 背景轨道
+        drawRect(color = trackColor, size = Size(w, h))
+        // 绘制斜条纹
+        clipRect(0f, 0f, w, h) {
+            val step = stripeWidth * 2
+            var x = -step + (offset % step)
+            while (x < w + step) {
+                // 绘制斜向平行四边形作为条纹
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(x, h)
+                    lineTo(x + stripeWidth * 0.5f, 0f)
+                    lineTo(x + stripeWidth * 1.5f, 0f)
+                    lineTo(x + stripeWidth, h)
+                    close()
+                }
+                drawPath(path, color = color)
+                x += step
+            }
+        }
+    }
+}
+
+/* ════════════════════════════════════════════════════════════
+ *  图片传输进度条
  * ════════════════════════════════════════════════════════════ */
 
 @Composable
@@ -476,13 +614,16 @@ fun ImageProgressBar(state: BleManager.ImageSendState, onCancel: () -> Unit) {
             Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF0D47A1).copy(alpha = 0.4f)), shape = RoundedCornerShape(8.dp)) {
                 Column(Modifier.padding(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Mesh${state.phaseText} ${state.rxCount}/${state.total}", fontSize = 12.sp, color = Color.White, modifier = Modifier.weight(1f))
-                        Text("${state.percent}%", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = if (state.phase == 0) Color(0xFF4FC3F7) else Color(0xFFCE93D8))
+                        if (state.total > 0) {
+                            Text("Mesh${state.phaseText} ${state.rxCount}/${state.total}", fontSize = 12.sp, color = Color.White, modifier = Modifier.weight(1f))
+                        } else {
+                            Text("等待网关通知...", fontSize = 12.sp, color = Color.White, modifier = Modifier.weight(1f))
+                        }
                         Spacer(Modifier.width(8.dp))
                         IconButton(onClick = onCancel, modifier = Modifier.size(24.dp)) { Icon(Icons.Default.Close, "取消", tint = Color(0xFFEF5350), modifier = Modifier.size(16.dp)) }
                     }
                     Spacer(Modifier.height(4.dp))
-                    LinearProgressIndicator(progress = { state.progress }, modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)), color = if (state.phase == 0) Color(0xFF4FC3F7) else Color(0xFFCE93D8), trackColor = Color.Gray.copy(alpha = 0.3f))
+                    AnimatedStripeBar(color = if (state.phase == 0) Color(0xFF4FC3F7) else Color(0xFFCE93D8))
                 }
             }
         }
@@ -516,12 +657,31 @@ fun ImageProgressBar(state: BleManager.ImageSendState, onCancel: () -> Unit) {
  * ════════════════════════════════════════════════════════════ */
 
 @Composable
-fun NodeActionDialog(node: MeshNode, onDismiss: () -> Unit, onSendText: () -> Unit, onSendImage: () -> Unit) {
+fun NodeActionDialog(node: MeshNode, lastSentBitmap: Bitmap? = null, onDismiss: () -> Unit, onSendText: () -> Unit, onSendImage: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, containerColor = MaterialTheme.colorScheme.surface,
         title = { Text("0x${h4(node.addr)}", color = Color.White) },
         text = {
-            Column {
-                Text(when (node.hops) { 0 -> "网关 (本机)"; 1 -> "直连节点"; else -> "${node.hops} 跳路由" }, fontSize = 12.sp, color = Color.Gray)
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(when (node.hops) { 0 -> "网关 (本机)"; 1 -> "直连节点"; else -> "${node.hops} 跳路由" }, fontSize = 12.sp, color = Color.Gray, modifier = Modifier.align(Alignment.Start))
+                Spacer(Modifier.height(12.dp))
+
+                // 显示最后一次发送的二值化图片
+                if (lastSentBitmap != null) {
+                    Text("上次发送的图片", fontSize = 11.sp, color = Color.Gray, modifier = Modifier.align(Alignment.Start))
+                    Spacer(Modifier.height(6.dp))
+                    Box(
+                        Modifier.fillMaxWidth(0.6f)
+                            .aspectRatio(lastSentBitmap.width.toFloat() / lastSentBitmap.height)
+                            .border(1.dp, Color.Gray.copy(alpha = 0.3f), RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(6.dp)).background(Color.White),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(lastSentBitmap.asImageBitmap(), "上次发送", Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
+                    }
+                } else {
+                    Text("暂无发送记录", fontSize = 11.sp, color = Color.Gray.copy(alpha = 0.5f))
+                }
+
                 Spacer(Modifier.height(16.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                     Card(Modifier.weight(1f).clickable { onSendText() }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)), shape = RoundedCornerShape(10.dp)) {
@@ -750,7 +910,7 @@ data class ImagePreviewData(
 
 @Composable
 fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
-                       onSend: (ByteArray, Int, Int, BleManager.ImageSendMode) -> Unit) {
+                       onSend: (ByteArray, Int, Int, BleManager.ImageSendMode, Bitmap) -> Unit) {
 
     var selectedMode by remember { mutableStateOf(BleManager.ImageSendMode.FAST) }
     var zoomBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -810,7 +970,7 @@ fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
             }
         },
         confirmButton = {
-            Button(onClick = { onSend(processed.imageData, data.resolution.width, data.resolution.height, selectedMode) },
+            Button(onClick = { onSend(processed.imageData, data.resolution.width, data.resolution.height, selectedMode, processed.previewBitmap) },
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
                 Icon(Icons.Default.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("发送 (${processed.dataSize}B)")
             }
@@ -920,6 +1080,10 @@ object ImageUtils {
  * ════════════════════════════════════════════════════════════ */
 
 fun h4(addr: Int): String = String.format("%04X", addr)
+
+fun isImageBusy(state: BleManager.ImageSendState): Boolean =
+    state is BleManager.ImageSendState.Sending || state is BleManager.ImageSendState.WaitingAck
+            || state is BleManager.ImageSendState.Finishing || state is BleManager.ImageSendState.MeshTransfer
 fun ByteArray.decodeToStringOrHex(): String = try {
     val s = toString(Charsets.UTF_8)
     if (s.all { it.code >= 0x20 && it != '\uFFFD' }) s else toHexString()

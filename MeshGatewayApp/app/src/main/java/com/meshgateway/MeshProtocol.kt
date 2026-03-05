@@ -8,6 +8,10 @@ package com.meshgateway
  *   AA 87 SRC(2) TOTAL_HI TOTAL_LO BITMAP[30]        — 缺包位图 (目标→网关→APP)
  *   AA 88 SRC(2) SEG_ID RX_COUNT(2)                   — 检查点应答 (目标→网关, 不转发APP)
  *   AA 89 SRC(2) PHASE(1) RX_COUNT(2) TOTAL(2)       — 流控进度 (网关→APP)
+ *
+ * v2.1 修复:
+ *   IMG_START 新增 XFER(1) 字段: 0=FAST(网关流控), 1=ACK(逐包确认立即注入)
+ *   帧格式: AA 04 DST(2) TOTAL(2) PKT(2) W(2) H(2) MODE(1) XFER(1)  共14字节
  */
 object MeshProtocol {
 
@@ -47,6 +51,10 @@ object MeshProtocol {
     /* ── 取模模式 ── */
     const val IMG_MODE_H_LSB    = 0x00
 
+    /* ── 传输模式 ── */
+    const val IMG_XFER_FAST     = 0x00   // 网关流控 (v2 默认)
+    const val IMG_XFER_ACK      = 0x01   // 逐包确认 (立即注入 mesh)
+
     /* ── 分包参数 ── */
     const val IMG_PKT_PAYLOAD   = 200
 
@@ -79,9 +87,16 @@ object MeshProtocol {
 
     /* ════════════════ 图片传输 — 下行帧 ════════════════ */
 
+    /**
+     * 构造图片 START 帧 (14 字节)
+     * AA 04 DST(2) TOTAL(2) PKT(2) W(2) H(2) MODE(1) XFER(1)
+     *
+     * @param xfer 传输模式: 0=FAST(网关流控), 1=ACK(逐包确认)
+     */
     fun buildImageStart(dstAddr: Int, totalBytes: Int, pktCount: Int,
-                        width: Int, height: Int, mode: Int = IMG_MODE_H_LSB): ByteArray {
-        val frame = ByteArray(13)
+                        width: Int, height: Int, mode: Int = IMG_MODE_H_LSB,
+                        xfer: Int = IMG_XFER_FAST): ByteArray {
+        val frame = ByteArray(14)
         frame[0]  = MAGIC.toByte()
         frame[1]  = CMD_IMG_START.toByte()
         frame[2]  = (dstAddr shr 8 and 0xFF).toByte()
@@ -95,6 +110,7 @@ object MeshProtocol {
         frame[10] = (height shr 8 and 0xFF).toByte()
         frame[11] = (height and 0xFF).toByte()
         frame[12] = mode.toByte()
+        frame[13] = xfer.toByte()
         return frame
     }
 

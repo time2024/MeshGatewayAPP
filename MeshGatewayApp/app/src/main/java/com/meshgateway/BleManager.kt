@@ -36,6 +36,8 @@ class BleManager(private val context: Context) {
 
     /** 图片发送状态 (UI 观察用) */
     sealed class ImageSendState {
+
+
         object Idle : ImageSendState()
         data class Sending(val seq: Int, val total: Int, val mode: ImageSendMode) : ImageSendState() {
             val progress: Float get() = if (total > 0) seq.toFloat() / total else 0f
@@ -94,6 +96,13 @@ class BleManager(private val context: Context) {
     /* ── 图片发送引擎 ── */
     private val _imageSendState = MutableStateFlow<ImageSendState>(ImageSendState.Idle)
     val imageSendState: StateFlow<ImageSendState> = _imageSendState
+
+    /** 图片传输是否正在进行中 (传输期间禁止查询拓扑和发送消息) */
+    val isImageBusy: Boolean get() {
+        val s = _imageSendState.value
+        return s is ImageSendState.Sending || s is ImageSendState.WaitingAck
+                || s is ImageSendState.Finishing || s is ImageSendState.MeshTransfer
+    }
 
     private var imgDstAddr: Int = 0
     private var imgData: ByteArray? = null
@@ -426,11 +435,18 @@ class BleManager(private val context: Context) {
         return true
     }
 
-    fun sendToNode(dstAddr: Int, payload: ByteArray) = sendRaw(MeshProtocol.buildUnicast(dstAddr, payload))
-    fun broadcast(payload: ByteArray) = sendRaw(MeshProtocol.buildBroadcast(payload))
+    fun sendToNode(dstAddr: Int, payload: ByteArray): Boolean {
+        if (isImageBusy) return false
+        return sendRaw(MeshProtocol.buildUnicast(dstAddr, payload))
+    }
+    fun broadcast(payload: ByteArray): Boolean {
+        if (isImageBusy) return false
+        return sendRaw(MeshProtocol.buildBroadcast(payload))
+    }
 
     fun queryTopology(): Boolean {
         if (_topoQuerying.value) return false
+        if (isImageBusy) return false
         val sent = sendRaw(MeshProtocol.buildTopoQuery())
         if (sent) {
             _topoQuerying.value = true
@@ -452,6 +468,8 @@ class BleManager(private val context: Context) {
      *  APP 的角色简化为:
      *    1. BLE 上传 (START + DATA×N + END)
      *    2. 显示 BLE 上传进度 → Mesh 传输进度 → 结果
+     *
+     *  v2.1: ACK 模式通过 xfer=1 告知网关立即注入 mesh, 不缓存
      * ════════════════════════════════════════════════════════════ */
 
     fun sendImage(dstAddr: Int, data: ByteArray, width: Int, height: Int,
@@ -479,8 +497,9 @@ class BleManager(private val context: Context) {
         Log.d(TAG, "sendImage: dst=0x${String.format("%04X", dstAddr)} " +
                 "${width}x${height} data=${data.size}B pkts=$imgTotalPkts mode=$mode")
 
-        // 1) 发送 START 帧
-        sendRaw(MeshProtocol.buildImageStart(dstAddr, data.size, imgTotalPkts, width, height))
+        // 1) 发送 START 帧 (xfer: FAST=0, ACK=1)
+        val xfer = if (mode == ImageSendMode.ACK) MeshProtocol.IMG_XFER_ACK else MeshProtocol.IMG_XFER_FAST
+        sendRaw(MeshProtocol.buildImageStart(dstAddr, data.size, imgTotalPkts, width, height, xfer = xfer))
 
         // 2) 开始发送数据分包
         _imageSendState.value = ImageSendState.Sending(0, imgTotalPkts, mode)
@@ -545,8 +564,8 @@ class BleManager(private val context: Context) {
         if (sent >= imgTotalPkts) {
             // BLE 上传完成 → 等待网关流控
             if (state is ImageSendState.Sending) {
-                _imageSendState.value = ImageSendState.MeshTransfer(0, imgTotalPkts, 0)
-                _debugInfo.value = "上传完成, 网关正在传输到目标节点..."
+                _imageSendState.value = ImageSendState.MeshTransfer(0, 0, 0)
+                _debugInfo.value = "上传完成, 等待网关通知..."
             }
             // v2: 动态超时 = 30s + 0.5s × 包数
             val timeoutMs = 30000L + imgTotalPkts * 500L
@@ -589,7 +608,7 @@ class BleManager(private val context: Context) {
 
         val curState = _imageSendState.value
         if (curState !is ImageSendState.Sending && curState !is ImageSendState.Finishing
-            && curState !is ImageSendState.MeshTransfer) return
+            && curState !is ImageSendState.MeshTransfer && curState !is ImageSendState.WaitingAck) return
 
         if (imgMode != ImageSendMode.ACK) {
             // 快速模式: ACK 不驱动发包, 但重置超时
@@ -660,7 +679,7 @@ class BleManager(private val context: Context) {
 
         val curState = _imageSendState.value
         if (curState !is ImageSendState.Sending && curState !is ImageSendState.Finishing
-            && curState !is ImageSendState.MeshTransfer) {
+            && curState !is ImageSendState.MeshTransfer && curState !is ImageSendState.WaitingAck) {
             Log.w(TAG, "handleImageResult: ignored (state=${curState::class.simpleName})")
             return
         }
