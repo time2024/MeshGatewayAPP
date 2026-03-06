@@ -634,8 +634,11 @@ class BleManager(private val context: Context) {
             handler.postDelayed(imgResultTimeout, timeoutMs)
             Log.d(TAG, "BLE upload done, waiting for gateway FC result (timeout=${timeoutMs}ms)")
         } else {
-            _imageSendState.value = ImageSendState.Sending(sent, imgTotalPkts, ImageSendMode.FAST)
-            _debugInfo.value = "上传到网关 $sent/$imgTotalPkts"
+            // 仅在 Sending 状态时更新上传进度, 不覆盖已收到的 MulticastTransfer 结果
+            if (state is ImageSendState.Sending) {
+                _imageSendState.value = ImageSendState.Sending(sent, imgTotalPkts, ImageSendMode.FAST)
+                _debugInfo.value = "上传到网关 $sent/$imgTotalPkts"
+            }
             handler.postDelayed(fastProgressTracker, 50)
         }
     }
