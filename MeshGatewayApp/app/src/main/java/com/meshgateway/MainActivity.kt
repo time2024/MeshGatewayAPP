@@ -1247,23 +1247,53 @@ data class ProcessedImage(
 
 object ImageUtils {
 
-    /** 从裁剪后的 Bitmap 处理: 缩放 → 二值化 → 取模 */
+    /** 从裁剪后的 Bitmap 处理: 缩放 → Floyd-Steinberg 抖动二值化 → 取模 (MSB-first) */
     fun processFromCropped(cropped: Bitmap, targetW: Int, targetH: Int): ProcessedImage {
         val scaled = Bitmap.createScaledBitmap(cropped, targetW, targetH, true)
-        val bwBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+
+        /* ── 1. 提取灰度矩阵（浮点，便于误差扩散）── */
+        val gray = FloatArray(targetW * targetH)
         for (y in 0 until targetH) {
             for (x in 0 until targetW) {
                 val pixel = scaled.getPixel(x, y)
                 val r = android.graphics.Color.red(pixel)
                 val g = android.graphics.Color.green(pixel)
                 val b = android.graphics.Color.blue(pixel)
-                val gray = (0.299 * r + 0.587 * g + 0.114 * b).toInt()
-                val bw = if (gray >= 128) 0xFFFFFFFF.toInt() else 0xFF000000.toInt()
-                bwBitmap.setPixel(x, y, bw)
+                gray[y * targetW + x] = (0.299f * r + 0.587f * g + 0.114f * b)
+            }
+        }
+
+        /* ── 2. Floyd-Steinberg 抖动二值化 ──
+         *  ┌────┬────┬────┐
+         *  │    │ ** │ 7  │  /16
+         *  ├────┼────┼────┤
+         *  │ 3  │ 5  │ 1  │  /16
+         *  └────┴────┴────┘
+         */
+        val bwBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        for (y in 0 until targetH) {
+            for (x in 0 until targetW) {
+                val idx = y * targetW + x
+                val oldPx = gray[idx].coerceIn(0f, 255f)
+                val newPx = if (oldPx >= 128f) 255f else 0f
+                val err = oldPx - newPx
+                bwBitmap.setPixel(x, y, if (newPx > 0f) 0xFFFFFFFF.toInt() else 0xFF000000.toInt())
+
+                // 扩散误差给相邻像素
+                if (x + 1 < targetW)
+                    gray[idx + 1] += err * 7f / 16f
+                if (y + 1 < targetH) {
+                    if (x > 0)
+                        gray[(y + 1) * targetW + (x - 1)] += err * 3f / 16f
+                    gray[(y + 1) * targetW + x] += err * 5f / 16f
+                    if (x + 1 < targetW)
+                        gray[(y + 1) * targetW + (x + 1)] += err * 1f / 16f
+                }
             }
         }
         if (scaled !== cropped) scaled.recycle()
 
+        /* ── 3. 1bpp 取模 (MSB-first: pixel 0 → bit 7) ── */
         val bytesPerRow = (targetW + 7) / 8
         val totalBytes = bytesPerRow * targetH
         val data = ByteArray(totalBytes)
@@ -1273,7 +1303,7 @@ object ImageUtils {
                 val isBlack = (pixel and 0x00FFFFFF) == 0
                 if (isBlack) {
                     val byteIndex = y * bytesPerRow + (x / 8)
-                    val bitIndex = x % 8
+                    val bitIndex = 7 - (x % 8)    // MSB-first: 与 RLE 编解码器、EPD 驱动一致
                     data[byteIndex] = (data[byteIndex].toInt() or (1 shl bitIndex)).toByte()
                 }
             }
