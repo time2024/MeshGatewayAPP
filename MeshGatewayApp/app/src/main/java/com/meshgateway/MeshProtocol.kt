@@ -55,13 +55,14 @@ object MeshProtocol {
     /* ── 取模模式 ── */
     const val IMG_MODE_H_LSB    = 0x00
     const val IMG_MODE_RLE      = 0x01   // RLE 游程编码压缩
+    const val IMG_MODE_JPEG     = 0x02   // JPEG 有损压缩
 
     /* ── 传输模式 ── */
     const val IMG_XFER_FAST     = 0x00   // 网关流控 (v2 默认)
     const val IMG_XFER_ACK      = 0x01   // 逐包确认 (立即注入 mesh)
 
     /* ── 分包参数 ── */
-    const val IMG_PKT_PAYLOAD   = 200
+    const val IMG_PKT_PAYLOAD   = 237   // 与固件 IMG_GW_PKT_PAYLOAD / Qt IMG_PKT_PAYLOAD 保持一致
 
     /** 构造单播帧 */
     fun buildUnicast(dstAddr: Int, data: ByteArray): ByteArray {
