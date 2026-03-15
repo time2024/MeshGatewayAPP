@@ -285,7 +285,7 @@ fun MeshApp(
                     val allNodes = mutableListOf(MeshNode(msg.gatewayAddr, 0))
                     allNodes.addAll(msg.nodes)
                     nodes = allNodes
-                    addLog("拓扑: 网关 0x$gwHex, ${msg.nodes.size} 节点")
+                    addLog("拓扑: 网关 0x$gwHex, ${allNodes.size} 节点 (含网关)")
                 }
                 is UpstreamMessage.DataFromNode -> {
                     addLog("← [0x${h4(msg.srcAddr)}] ${msg.payload.decodeToStringOrHex()}")

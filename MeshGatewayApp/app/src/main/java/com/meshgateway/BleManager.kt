@@ -588,7 +588,8 @@ class BleManager(private val context: Context) {
         if (imgCancelled.get()) return
 
         val seq = imgFastSeq
-        if (seq >= imgTotalPkts) {
+        val pkts = imgPackets
+        if (seq >= imgTotalPkts || seq >= pkts.size) {
             // 所有数据包发完, 发 END 帧
             val crc = MeshProtocol.crc16(imgData!!)
             sendRaw(MeshProtocol.buildImageEnd(imgDstAddr, crc))
@@ -596,7 +597,7 @@ class BleManager(private val context: Context) {
             return
         }
 
-        val frame = MeshProtocol.buildImageData(imgDstAddr, seq, imgPackets[seq])
+        val frame = MeshProtocol.buildImageData(imgDstAddr, seq, pkts[seq])
         sendRaw(frame)
         imgFastSeq = seq + 1
 
@@ -845,6 +846,9 @@ class BleManager(private val context: Context) {
     fun resetImageSendState() { _imageSendState.value = ImageSendState.Idle }
 
     private fun imgCleanup() {
+        imgCancelled.set(true)
+        handler.removeCallbacks(imgFastPacedSender)
+        handler.removeCallbacks(fastProgressTracker)
         imgData = null
         imgPackets = emptyList()
         imgMulticastTargets = null
